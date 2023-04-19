@@ -1,0 +1,330 @@
+---
+title: "JPM Predictive Model"
+author: "Thao Nguyen Pham"
+date: "4/18/2023"
+output: html_document
+---
+#### **1. PREPARE THE DATASET**
+
+1.1. Import the dataset
+
+* S&P500 dataset 
+
+```{r}
+sp500 <- read.csv("C:/Users/PC/Desktop/Project/PredictiveModeling/sp500-1022.csv")
+head(sp500)
+```
+
+* JPMorgan Chase dataset 
+
+```{r}
+jpm <- read.csv("C:/Users/PC/Desktop/Project/PredictiveModeling/jpm-1022.csv")
+head(jpm)
+```
+
+* US 3-month treasury bills dataset 
+
+```{r}
+US3M <- read.csv("C:/Users/PC/Desktop/Project/PredictiveModeling/US3M.csv", fileEncoding = 'UTF-8-BOM')
+head(US3M)
+```
+
+* Economic indicators dataset 
+
+```{r}
+indicator <- read.csv("C:/Users/PC/Desktop/Project/PredictiveModeling/indicators.csv", fileEncoding = 'UTF-8-BOM')
+head(indicator)
+```
+
+1.2. CALCULATE MARKET QUARTERLY RATE OF RETURN 
+
+```{r}
+#create function to calculate quarterly simple return rate
+quarterly_return <- function (df) {
+  
+  df_quarterly_return <- df #create a copy of the input dataframe
+  
+  #loop through dataframe to calculate quarterly return, in which current quarter return = ((current price - previous price)/previous price)*100
+  for (c in 2:ncol(df_quarterly_return)) {
+    for (r in 2:nrow(df_quarterly_return)) {
+      df_quarterly_return[r, c+1] <- as.numeric(format((df[r, c] - df[r-1, c])/df[r-1, c]), digits = 4)
+    }
+    df_quarterly_return[1, c+1] = 0 # set the value of the first row = 0 
+  }
+  return (df_quarterly_return)
+}
+```
+
+* Calculate market quarterly simple rate of return
+```{r}
+sp500_qr <- quarterly_return(sp500)[-1, ]
+colnames(sp500_qr) <- c("Date", "sp500_price", "sp500_quarterlyReturn")
+head(sp500_qr)
+```
+
+* Calculate JPM stock's quarterly simple rate of return
+```{r}
+jpm_qr <- quarterly_return(jpm)[-1, ]
+colnames(jpm_qr) <- c("Date", "jpm_price", "jpm_quarterlyReturn")
+head(jpm_qr)
+```
+
+1.3. Merge the quarterly return datasets into 1 table
+
+```{r}
+#Merge sp500_qr & jpm_qr & US3M together
+ds <- merge(sp500_qr, jpm_qr, by = c("Date" = "Date"), all.x = TRUE)
+ds
+```
+
+1.4. Find Beta
+
+** Reference for computing the betas here: https://www.wikihow.com/Calculate-Beta#:~:text=Find%20the%20coefficient%20for%20the,x%20value%20is%20your%20beta.**
+
+```{r}
+ds$beta <- c(ds$sp500_quarterlyReturn - US3M$Risk.free.Rate)/(ds$jpm_quarterlyReturn - US3M$Risk.free.Rate)
+ds
+```
+
+#### **II. Development of statistical model**
+
+2.1. Check the normality of the Quarterly Closing Price (QCP)
+
+```{r}
+#draw Q-Q plot to check the normality of QCP
+qqnorm(ds$jpm_price, pch = 1, frame = FALSE)
+qqline(ds$jpm_price, col = "steelblue", lwd = 2)
+```
+
+```{r}
+#perform Shapiro-Wilk test for normality
+shapiro.test(ds$jpm_price) 
+#p-value < 0.05 => not normal distributed
+```
+
+2.2. AFTER JOHNSON TRANSFORMATION ON MINITAB STATISTICAL SOFTWARE
+
+Enter the parameter values from Johnson Transformation
+γ = 0.636034, δ = 0.613498, 𝜉 = 20.8924 and 𝜆 = 144.6576
+
+```{r}
+#Import transformed JPM QCP
+jpm_trans <- read.csv("C:/Users/PC/Desktop/Project/PredictiveModeling/jpm_trans.csv", fileEncoding = 'UTF-8-BOM')
+colnames(jpm_trans)[2] <- "QCP_T"
+jpm_trans
+```
+
+```{r}
+#draw Q-Q plot to check normality of transformed JPM QCP
+qqnorm(jpm_trans$QCP_T, pch = 1, frame = FALSE)
+qqline(jpm_trans$QCP_T, col = "steelblue", lwd = 2)
+```
+
+```{r}
+#perform Shapiro-Wilk test for normality after Johnson transformation
+shapiro.test(jpm_trans$QCP_T) 
+```
+
+2.3. CHECK CORRELATION USING DATA TRANSFORMATION
+
+```{r}
+library(corrplot)
+```
+
+```{r}
+#Generate the dataset that contains all indicators and transformed JPM QCP
+df <- Reduce(function(...) merge(..., all = TRUE, by = "Date"),
+       list(ds[, c(1, 6)], indicator, jpm_trans))
+df
+```
+
+```{r}
+#Check the correlation among the indicators
+corrplot(cor(df[, c(2:12)]), type = "upper", addCoef.col="orange", number.cex=0.75)
+```
+
+2.4. VARIANCE INFLATION FACTOR
+
+```{r}
+library(car)  
+```
+
+```{r}
+# Check Variance Inflation Factor (VIF) to verify the existence of multicollinearity among attributable indicators
+#fit the regression model
+model <- lm(QCP_T ~ beta + PB + PE + FCF.Share + PEG + 
+            Dividend.Yield + GDP + Interest.Rate + CPI + PSR,
+            data = df)
+
+#view the output of the regression model
+summary(model)
+
+#calculate the VIF for each predictor variable in the model
+vif(model)
+```
+
+DROP HIGH VIF SCORES FACTORS > 10 (Which is GDP & PB)
+```{r}
+#fit the regression model
+model <- lm(QCP_T ~ beta + PE + FCF.Share + PEG + 
+            Dividend.Yield + Interest.Rate + CPI + PSR,
+            data = df)
+
+#view the output of the regression model
+summary(model)
+
+#calculate the VIF for each predictor variable in the model
+vif(model)
+```
+
+2.5. LASSO REGRESSION
+
+Prepare data for lasso regression
+```{r}
+library(caTools)
+library(caret)
+library(dplyr)
+```
+
+```{r}
+#create a dataset containing only indicators for training and testing purpose
+y <- as.matrix(df$QCP_T)    #response variable
+x <- model.matrix(QCP_T ~ .^2, df[, -1])[, -1]   #predictor variables
+
+
+data <- data.frame(x, QCP_T = y)
+
+# Set the proportion of data to use for training
+set.seed(1)
+train_prop <- 0.8
+
+# Split the data into 80% training and 20% testing sets
+train_rows <- sample(1:nrow(data), round(train_prop * nrow(data)), replace = FALSE)
+train_data <- data[train_rows, ]
+test_data <- data[-train_rows, ]
+
+
+y_train <- as.matrix(train_data$QCP_T)
+x_train <- as.matrix(select(train_data, -QCP_T))
+
+y_test <- as.matrix(test_data$QCP_T)
+x_test <- as.matrix(select(test_data, -QCP_T))
+
+```
+
+Find optimal lambda value for lasso regression
+```{r}
+library(glmnet)
+```
+
+```{r}
+# Perform k-fold cross-validation to find optimal lambda value (default nfolds = 10)
+lasso_reg <- cv.glmnet(x_train, y_train, alpha = 1,standardize = TRUE) 
+plot(lasso_reg)
+
+#find optimal lambda value that minimizes test MSE
+best_lambda <- lasso_reg$lambda.min
+best_lambda
+```
+
+Train LASSO model
+```{r}
+# Fit the lasso model with the optimal lambda value
+lasso_model <- glmnet(x_train, y_train, alpha = 1, lambda = best_lambda, standardize = TRUE)
+
+# Compute R^2 from fact and predicted values
+eval_results <- function(fact, predicted, df) {
+  SSE <- sum((predicted - fact)^2)
+  SST <- sum((fact - mean(fact))^2)
+  R_square <- 1 - SSE / SST
+  RMSE <- sqrt(SSE/nrow(df)) 
+  
+  print(paste("SSE:", SSE))
+  print(paste("SST:", SST))
+  print(paste("R_square:", R_square))
+  print(paste("RMSE:", RMSE))
+  print("--------------")
+  }
+
+#Predict and evaluate lasso model using training dataset
+predict_train <- predict(lasso_model, s = best_lambda, newx = x_train)
+eval_results(y_train, predict_train, y_train)
+
+#Predict and evaluate lasso model using testing dataset
+predict_test <- predict(lasso_model, s = best_lambda, newx = x_test)
+eval_results(y_test, predict_test, y_test)
+
+#Fit lasso model on full dataset
+out <- glmnet(x, y, alpha = 1) # Display coefficients using lambda chosen by CV
+lasso_coef <- coef(out, s = best_lambda)
+plot(out, xvar = "lambda", label = TRUE)
+print (lasso_coef)
+```
+
+2.6. BACKWARD ELIMINATION
+```{r}
+library(MASS)
+```
+
+FIT MODEL WITH IMPORTANT INDICATORS & INTERACTIONS FROM LASSO 
+```{r}
+important_after_lasso <- c("PB", "PE", "PEG", "CPI", "FCF.Share", "Dividend.Yield", "GDP", "Interest.Rate" ,
+               "PE.Interest.Rate", "FCF.Share.PEG", "FCF.Share.Interest.Rate", "FCF.Share.CPI", 
+               "PEG.Dividend.Yield", "PEG.Interest.Rate")
+train_data_1 <- train_data[, important_after_lasso]
+
+#fit model based on important indicators and interactions from LASSO
+model <- lm(train_data$QCP_T ~ ., data = train_data_1)
+summary(model)
+```
+
+APPLY BACKWARD ELIMINATION
+
+```{r}
+#Apply backward elimination
+step.model <- stepAIC(model, direction = "backward", trace = TRUE)
+summary(step.model)
+a <- summary(step.model)
+```
+
+3. MODEL EVALUATION
+
+```{r}
+#predict the model
+predict_model_train <- predict(step.model, newdata = data.frame(x_train))
+predict_model_test <- predict(step.model, newdata = data.frame(x_test))
+
+#calculate mean & sum of residuals
+mean(a$residuals)
+sum(a$residuals)
+
+#Calculate the RMSE
+rmse_train <- sqrt(mean((y_train - predict_model_train )^2))
+rmse_train
+
+rmse_test <- sqrt(mean((y_test - predict_model_test)^2))
+rmse_test
+
+#Calculate the RRMSE
+rrmse_train <- rmse_train/diff(range(y_train)) * 100
+rrmse_train
+
+rrmse_test <- rmse_test/diff(range(y_test)) * 100
+rrmse_test
+
+#Calculate the MAPE
+mape_train <- mean(abs((y_train - predict_model_train) / y_train)) * 100
+mape_train
+
+mape_test <- mean(abs((y_test - predict_model_test) / y_test)) * 100
+mape_test
+
+#Test for normality of residuals
+shapiro.test(step.model$residuals)
+```
+
+```{R}
+#Test for autocorrelation
+durbinWatsonTest(step.model)
+plot(step.model)
+```
